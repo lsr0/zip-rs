@@ -77,10 +77,9 @@ fn unsupported_zip_error<T>(detail: &'static str) -> ZipResult<T>
 
 impl<R: Read+io::Seek> ZipArchive<R>
 {
-    /// Opens a Zip archive and parses the central directory
-    pub fn new(mut reader: R) -> ZipResult<ZipArchive<R>> {
-        let (footer, cde_start_pos) = try!(spec::CentralDirectoryEnd::find_and_parse(&mut reader));
-
+    /// Get the directory start offset and number of files. This is done in a
+    /// separate function to ease the control flow design.
+    fn get_directory_counts(mut reader: &mut R, footer: &spec::CentralDirectoryEnd, cde_start_pos: u32) -> ZipResult<(u32, u64, usize)> {
         if footer.disk_number != footer.disk_with_central_directory { return unsupported_zip_error("Support for multi-disk files is not implemented") }
 
         // Some zip files have data prepended to them, resulting in the offsets all being too small. Get the amount of
@@ -91,6 +90,56 @@ impl<R: Read+io::Seek> ZipArchive<R>
 
         let directory_start = (footer.central_directory_offset + archive_offset) as u64;
         let number_of_files = footer.number_of_files_on_this_disk as usize;
+
+        // See if there's a ZIP64 footer. The ZIP64 locator if present will
+        // have its signature 20 bytes in front of the standard footer. The
+        // standard footer, in turn, is 22+N bytes large, where N is the
+        // comment length. Therefore:
+
+        if let Err(_) = reader.seek(io::SeekFrom::Current(-(20 + 22 + footer.zip_file_comment.len() as i64))) {
+            // Empty Zip files will have nothing else so this error might be fine. If
+            // not, we'll find out soon.
+            return Ok((archive_offset, directory_start, number_of_files));
+        }
+
+        let locator64 = match spec::Zip64CentralDirectoryEndLocator::parse(&mut reader) {
+            Ok(loc) => loc,
+            Err(ZipError::InvalidArchive(_)) => {
+                // No ZIP64 header; that's actually fine.
+                return Ok((archive_offset, directory_start, number_of_files));
+            },
+            Err(e) => {
+                // Yikes, a real problem
+                return Err(e);
+            },
+        };
+
+        if footer.disk_number as u32 != locator64.disk_with_central_directory {
+            return unsupported_zip_error("Support for multi-disk files is not implemented")
+        }
+
+        // XXX TODO: we should recalculate this as above
+        let archive_offset = 0u32;
+
+        let zip64_footer_start = locator64.end_of_central_directory_offset + archive_offset as u64;
+        try!(reader.seek(io::SeekFrom::Start(zip64_footer_start)));
+        let footer = try!(spec::Zip64CentralDirectoryEnd::parse(&mut reader));
+
+        if footer.disk_number != footer.disk_with_central_directory {
+            return unsupported_zip_error("Support for multi-disk files is not implemented")
+        }
+
+        let directory_start = footer.central_directory_offset + archive_offset as u64;
+        Ok((archive_offset, directory_start, footer.number_of_files as usize))
+    }
+
+    /// Opens a Zip archive and parses the central directory
+    pub fn new(mut reader: R) -> ZipResult<ZipArchive<R>> {
+        let (footer, cde_start_pos) = try!(spec::CentralDirectoryEnd::find_and_parse(&mut reader));
+
+        if footer.disk_number != footer.disk_with_central_directory { return unsupported_zip_error("Support for multi-disk files is not implemented") }
+
+        let (archive_offset, directory_start, number_of_files) = try!(Self::get_directory_counts(&mut reader, &footer, cde_start_pos));
 
         let mut files = Vec::with_capacity(number_of_files);
         let mut names_map = HashMap::new();
